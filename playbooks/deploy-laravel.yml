@@ -8,36 +8,74 @@
 
   tasks:
     # ============================================
-    # Prerequisites: Storage Provisioner
+    # Prerequisite: Install Storage Provisioner
     # ============================================
-    - name: Install local-path-provisioner
+    - name: Check if local-path-provisioner namespace exists
+      ansible.builtin.command:
+        cmd: kubectl get ns local-path-storage
+      register: lps_ns
+      failed_when: false
+      changed_when: false
+
+    - name: Install local-path-provisioner if missing
       ansible.builtin.command:
         cmd: kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.24/deploy/local-path-storage.yaml
+      when: lps_ns.rc != 0
       register: provisioner_result
       changed_when: "'created' in provisioner_result.stdout or 'configured' in provisioner_result.stdout"
+      failed_when: provisioner_result.rc != 0 and provisioner_result.rc is not none
 
-    - name: Wait for local-path-provisioner to be ready
+    - name: Wait for local-path-provisioner to be ready (if just installed)
       ansible.builtin.command:
         cmd: kubectl wait --for=condition=ready pod -l app=local-path-provisioner -n local-path-storage --timeout=60s
+      register: provisioner_wait
       retries: 3
       delay: 5
-      register: provisioner_wait
       until: provisioner_wait.rc == 0
       ignore_errors: yes
+      when: lps_ns.rc != 0
 
-    - name: Set local-path as default StorageClass
+    - name: Check if StorageClass local-path exists
       ansible.builtin.command:
-        cmd: kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
-      register: patch_result
-      changed_when: "'patched' in patch_result.stdout"
+        cmd: kubectl get sc local-path -o json
+      register: sc_json
       failed_when: false
+      changed_when: false
 
-    - name: Verify StorageClass exists
+    - name: Set StorageClass facts
+      ansible.builtin.set_fact:
+        sc_exists: "{{ sc_json.rc == 0 }}"
+        sc_volume_binding_mode: "{{ (sc_json.stdout | from_json).volumeBindingMode if sc_json.rc == 0 and (sc_json.stdout | from_json).volumeBindingMode is defined else '' }}"
+      changed_when: false
+
+    - name: Create StorageClass manifest only if missing
+      ansible.builtin.copy:
+        dest: /root/sc-localpath.yaml
+        content: |
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: local-path
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: rancher.io/local-path
+          reclaimPolicy: Delete
+          volumeBindingMode: Immediate
+      when: not sc_exists
+      register: sc_manifest_file
+
+    - name: Apply StorageClass if created
+      ansible.builtin.command:
+        cmd: kubectl apply -f /root/sc-localpath.yaml
+      when: not sc_exists
+      register: sc_apply
+      changed_when: "'created' in sc_apply.stdout or 'configured' in sc_apply.stdout"
+      failed_when: sc_apply.rc != 0 and sc_apply.rc is not none
+
+    - name: Confirm StorageClass is present
       ansible.builtin.command:
         cmd: kubectl get storageclass local-path
-      register: sc_check
       changed_when: false
-      failed_when: sc_check.rc != 0
 
     # ============================================
     # Copy Manifests to Master Node
@@ -91,6 +129,19 @@
       changed_when: "'created' in configmap_result.stdout or 'configured' in configmap_result.stdout"
 
     # ============================================
+    # CLEANUP BEFORE MYSQL DEPLOY
+    # ============================================
+    - name: Delete stale PVC if exists
+      ansible.builtin.shell:
+        cmd: kubectl delete pvc mysql-pvc -n {{ namespace }} --ignore-not-found=true
+      changed_when: false
+
+    - name: Delete old MySQL pod if exists
+      ansible.builtin.shell:
+        cmd: kubectl delete pod -l app=mysql -n {{ namespace }} --ignore-not-found=true
+      changed_when: false
+
+    # ============================================
     # Step 4: Deploy MySQL
     # ============================================
     - name: Apply MySQL resources (PVC + StatefulSet + Service)
@@ -103,8 +154,8 @@
       ansible.builtin.command:
         cmd: kubectl get pvc mysql-pvc -n {{ namespace }} -o jsonpath='{.status.phase}'
       register: pvc_status
-      retries: 10
-      delay: 5
+      retries: 20
+      delay: 10
       until: pvc_status.stdout == "Bound"
       changed_when: false
 
@@ -274,7 +325,7 @@
           - "=================================="
 
     # ============================================
-    # Optional: Run Laravel Migrations
+    #  Run Laravel Migrations
     # ============================================
     - name: Run Laravel migrations
       ansible.builtin.shell:
@@ -302,7 +353,7 @@
           - "  ✓ MySQL: {{ 'Running' if mysql_wait.rc == 0 else 'Failed' }}"
           - "  ✓ Laravel: {{ 'Running' if laravel_wait.rc == 0 else 'Failed' }}"
           - "  ✓ Service: {{ 'Available' if service_check.rc == 0 else 'Failed' }}"
-          - "  ✓ Storage: local-path provisioner"
+          - "  ✓ Storage: local-path (Immediate binding)"
           - ""
           - "Next Steps:"
           - "  1. Test application: curl http://{{ node_ip.stdout }}:30080"
