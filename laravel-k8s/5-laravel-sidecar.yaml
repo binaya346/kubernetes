@@ -1,0 +1,154 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: laravel
+  namespace: laravel-app
+  labels:
+    app: laravel
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: laravel
+  template:
+    metadata:
+      labels:
+        app: laravel
+    spec:
+      # Init containers
+      initContainers:
+        # Wait for MySQL BEFORE starting main containers
+        - name: wait-for-mysql
+          image: busybox:1.35
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for MySQL to be ready..."
+              until nc -z mysql-service 3306; do
+                echo "MySQL is unavailable - sleeping"
+                sleep 2
+              done
+              echo "MySQL is up and ready!"
+
+        # Copy Laravel files to shared volume
+        - name: copy-laravel-app
+          image: rijalbinaya2/laravel-app:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Copying Laravel application files..."
+              cp -r /var/www/. /app/
+
+              echo "Setting permissions..."
+              chown -R www-data:www-data /app/storage /app/bootstrap/cache
+
+              echo "Files copied successfully!"
+          volumeMounts:
+            - name: app-files
+              mountPath: /app
+
+      containers:
+        # Container 1: Nginx
+        - name: nginx
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+              name: http
+              protocol: TCP
+          volumeMounts:
+            - name: app-files
+              mountPath: /var/www
+              readOnly: true
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+          # More lenient probes for Nginx
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 60 # Give PHP-FPM time to start
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6 # Allow 6 failures before restart
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+        # Container 2: PHP-FPM
+        - name: php-fpm
+          image: rijalbinaya2/laravel-app:latest
+          ports:
+            - containerPort: 9000
+              name: php-fpm
+              protocol: TCP
+          volumeMounts:
+            - name: app-files
+              mountPath: /var/www
+          envFrom:
+            - configMapRef:
+                name: laravel-config
+          env:
+            - name: APP_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: laravel-secret
+                  key: APP_KEY
+            - name: DB_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: laravel-secret
+                  key: MYSQL_DATABASE
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: laravel-secret
+                  key: MYSQL_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: laravel-secret
+                  key: MYSQL_PASSWORD
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          # CRITICAL: Very lenient probes for PHP-FPM
+          livenessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 90 # Wait 90 seconds before checking
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 10 # Allow many failures (migrations take time)
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 60 # Wait 60 seconds
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+
+      # Shared volumes
+      volumes:
+        - name: app-files
+          emptyDir: {}
+        - name: nginx-config
+          configMap:
+            name: nginx-config

@@ -1,0 +1,16 @@
+---
+
+- name: Ensure kernel modules are loaded
+  copy:
+    dest: /etc/modules-load.d/k8s.conf
+    content: |
+      br_netfilter
+      overlay
+
+- name: Load overlay module
+  modprobe:
+    name: overlay
+
+- name: Load br_netfilter module
+  modprobe:
+    name: br_netfilter

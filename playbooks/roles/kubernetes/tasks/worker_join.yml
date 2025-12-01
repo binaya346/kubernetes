@@ -1,0 +1,10 @@
+---
+
+- name: Read join command from master
+  slurp:
+    src: /join-command.sh
+  register: join_cmd_file
+  delegate_to: "{{ groups['master'][0] }}"
+
+- name: Run join command
+  command: "{{ join_cmd_file.content | b64decode }}"

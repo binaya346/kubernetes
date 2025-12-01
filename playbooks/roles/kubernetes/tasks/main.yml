@@ -1,0 +1,24 @@
+---
+
+- name: Disable swap
+  include_tasks: swap.yml
+
+- name: Load kernel modules
+  include_tasks: modules.yml
+
+- name: Configure sysctl params
+  include_tasks: sysctl.yml
+
+- name: Install and configure containerd
+  include_tasks: containerd.yml
+
+- name: Install Kubernetes packages (kubeadm, kubelet, kubectl)
+  include_tasks: kube_packages.yml
+
+- name: Initialize Master Node
+  when: inventory_hostname in groups['master']
+  include_tasks: master_init.yml
+
+- name: Join Worker Node
+  when: inventory_hostname in groups['worker']
+  include_tasks: worker_join.yml

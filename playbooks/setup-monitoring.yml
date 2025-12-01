@@ -1,0 +1,211 @@
+---
+- name: Setup Monitoring and Logging Stack
+  hosts: master
+  become: yes
+
+  tasks:
+    # ==================== HELM INSTALLATION ====================
+    - name: Check if Helm is installed
+      ansible.builtin.command:
+        cmd: helm version
+      register: helm_check
+      failed_when: false
+      changed_when: false
+
+    - name: Download Helm installer
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        dest: /tmp/get_helm.sh
+        mode: "0700"
+      when: helm_check.rc != 0
+
+    - name: Install Helm
+      ansible.builtin.command:
+        cmd: /tmp/get_helm.sh
+      when: helm_check.rc != 0
+      changed_when: true
+
+    # ==================== MONITORING (PROMETHEUS + GRAFANA) ====================
+    - name: Add Prometheus Helm repository
+      ansible.builtin.command:
+        cmd: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      register: repo_add
+      changed_when: "'already exists' not in repo_add.stderr"
+      failed_when: false
+
+    - name: Update Helm repositories
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+
+    - name: Create monitoring namespace
+      ansible.builtin.command:
+        cmd: kubectl create namespace monitoring
+      register: ns_create
+      failed_when: false
+      changed_when: "'created' in ns_create.stdout"
+
+    - name: Check if Prometheus stack is already installed
+      ansible.builtin.command:
+        cmd: helm list -n monitoring
+      register: helm_list
+      changed_when: false
+
+    - name: Install kube-prometheus-stack
+      ansible.builtin.command:
+        cmd: >
+          helm install prometheus prometheus-community/kube-prometheus-stack
+          --namespace monitoring
+          --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+          --set grafana.adminPassword=admin123
+          --set grafana.service.type=NodePort
+          --set grafana.service.nodePort=30300
+      when: "'prometheus' not in helm_list.stdout"
+      changed_when: true
+
+    - name: Wait for Grafana to be ready
+      ansible.builtin.command:
+        cmd: kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=grafana -n monitoring --timeout=300s
+      retries: 3
+      delay: 10
+      changed_when: false
+
+    # ==================== METRICS SERVER ====================
+    - name: Install Metrics Server
+      ansible.builtin.command:
+        cmd: kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      register: metrics_install
+      changed_when: "'created' in metrics_install.stdout or 'configured' in metrics_install.stdout"
+
+    - name: Patch Metrics Server for insecure TLS
+      ansible.builtin.command:
+        cmd: >
+          kubectl patch deployment metrics-server -n kube-system --type='json'
+          -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+      register: metrics_patch
+      changed_when: "'patched' in metrics_patch.stdout"
+      failed_when: false
+
+    # ==================== LOGGING (LOKI + PROMTAIL) ====================
+    - name: Add Grafana Loki repository
+      ansible.builtin.command:
+        cmd: helm repo add grafana https://grafana.github.io/helm-charts
+      register: loki_repo
+      changed_when: "'already exists' not in loki_repo.stderr"
+      failed_when: false
+
+    - name: Update Helm repositories again
+      ansible.builtin.command:
+        cmd: helm repo update
+      changed_when: false
+
+    - name: Check if Loki is already installed
+      ansible.builtin.command:
+        cmd: helm list -n monitoring
+      register: loki_check
+      changed_when: false
+
+    - name: Install Loki stack (Loki + Promtail)
+      ansible.builtin.command:
+        cmd: >
+          helm install loki grafana/loki-stack
+          --namespace monitoring
+          --set promtail.enabled=true
+          --set loki.persistence.enabled=true
+          --set loki.persistence.size=5Gi
+      when: "'loki' not in loki_check.stdout"
+      changed_when: true
+
+    - name: Wait for Loki to be ready
+      ansible.builtin.command:
+        cmd: kubectl wait --for=condition=ready pod -l app=loki -n monitoring --timeout=180s
+      retries: 3
+      delay: 10
+      changed_when: false
+
+    # ==================== CONFIGURE GRAFANA DATA SOURCES ====================
+    - name: Create Grafana datasource ConfigMap
+      ansible.builtin.copy:
+        dest: /tmp/grafana-datasources.yaml
+        content: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: grafana-datasources
+            namespace: monitoring
+            labels:
+              grafana_datasource: "1"
+            annotations:
+              grafana_datasource: "1"
+          data:
+            datasources.yaml: |
+              apiVersion: 1
+              datasources:
+              - name: Loki
+                type: loki
+                access: proxy
+                url: http://loki:3100
+                isDefault: false
+                editable: true
+
+    - name: Apply Grafana datasource ConfigMap
+      ansible.builtin.command:
+        cmd: kubectl apply -f /tmp/grafana-datasources.yaml
+      register: datasource_apply
+      changed_when: "'created' in datasource_apply.stdout or 'configured' in datasource_apply.stdout"
+
+    # ==================== CREATE LARAVEL SERVICE MONITOR ====================
+    - name: Create Laravel ServiceMonitor
+      ansible.builtin.copy:
+        dest: /tmp/laravel-servicemonitor.yaml
+        content: |
+          apiVersion: monitoring.coreos.com/v1
+          kind: ServiceMonitor
+          metadata:
+            name: laravel-monitor
+            namespace: laravel-app
+            labels:
+              app: laravel
+          spec:
+            selector:
+              matchLabels:
+                app: laravel
+            endpoints:
+            - port: http
+              interval: 30s
+              path: /metrics
+
+    - name: Apply Laravel ServiceMonitor
+      ansible.builtin.command:
+        cmd: kubectl apply -f /tmp/laravel-servicemonitor.yaml
+      register: sm_apply
+      changed_when: "'created' in sm_apply.stdout or 'configured' in sm_apply.stdout"
+
+    # ==================== DISPLAY ACCESS INFO ====================
+    - name: Get Grafana service info
+      ansible.builtin.command:
+        cmd: kubectl get svc prometheus-grafana -n monitoring
+      register: grafana_svc
+      changed_when: false
+
+    - name: Display access information
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "MONITORING STACK DEPLOYED SUCCESSFULLY!"
+          - "=========================================="
+          - ""
+          - "Grafana Dashboard:"
+          - "  URL: http://185.199.53.175:30300"
+          - "  Username: admin"
+          - "  Password: admin123"
+          - ""
+          - "Prometheus (via kubectl port-forward):"
+          - "  kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090"
+          - ""
+          - "To view logs:"
+          - "  kubectl logs -f deployment/laravel-app -n laravel-app"
+          - ""
+          - "To view metrics:"
+          - "  kubectl top pods -n laravel-app"
+          - "=========================================="

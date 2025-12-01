@@ -1,0 +1,31 @@
+---
+
+- name: Initialize Kubernetes Master
+  command: kubeadm init --pod-network-cidr=192.168.0.0/16
+  register: kubeadm_init_output
+  args:
+    creates: /etc/kubernetes/admin.conf
+
+- name: Extract join command for workers
+  set_fact:
+    join_cmd: "{{ kubeadm_init_output.stdout_lines | select('search', 'kubeadm join') | list | first }}"
+
+- name: Save join command to file
+  copy:
+    dest: /join-command.sh
+    content: "{{ join_cmd }}"
+
+- name: Create .kube directory
+  file:
+    path: /root/.kube
+    state: directory
+    mode: '0755'
+
+- name: Copy kubeconfig to root
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: yes
+
+- name: Install Calico CNI
+  command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.2/manifests/calico.yaml

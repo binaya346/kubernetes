@@ -1,0 +1,61 @@
+# --------------------------
+# Ansible specific
+# --------------------------
+
+# Retry files
+*.retry
+
+# Vault files (edit extensions if you use custom names)
+*.vault
+vault.yml
+vault.yaml
+
+# Dynamic inventory output
+inventory/*.json
+inventory/*.tmp
+inventory/*.cache
+
+# Inventory secrets
+inventory/*secret*
+inventory/*vault*
+
+# Ansible cache
+.ansible/
+*.fact
+
+# Logs
+*.log
+
+# --------------------------
+# Python / Virtual Env
+# --------------------------
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ansible-venv/
+
+# --------------------------
+# Editor / IDE
+# --------------------------
+
+.vscode/
+.idea/
+*.swp
+*~
+
+# --------------------------
+# OS files
+# --------------------------
+
+.DS_Store
+Thumbs.db
+
+# --------------------------
+# Terraform leftovers (if used with Ansible)
+# --------------------------
+
+.terraform/
+terraform.tfstate
+terraform.tfstate.backup

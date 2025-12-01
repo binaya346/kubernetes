@@ -1,0 +1,26 @@
+---
+- name: Prepare Python environment & gather facts
+  hosts: all
+  become: yes
+  gather_facts: false
+
+  pre_tasks:
+    - name: Gather facts using modern setup module
+      ansible.builtin.setup:
+
+    - name: Ensure required packages for node preparation
+      ansible.builtin.package:
+        name:
+          - curl
+          - apt-transport-https
+        state: present
+
+- name: Kubernetes Cluster Setup
+  hosts: all
+  become: yes
+  vars:
+    is_master: "{{ inventory_hostname in groups['master'] }}"
+    is_worker: "{{ inventory_hostname in groups['worker'] | default([]) }}"
+
+  roles:
+    - role: kubernetes
