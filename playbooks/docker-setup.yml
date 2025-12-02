@@ -1,0 +1,117 @@
+---
+- name: Install Docker and Docker Compose
+  hosts: all
+  become: yes
+
+  tasks:
+    # ==================== INSTALL DOCKER ====================
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - software-properties-common
+        state: present
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    # ==================== CONFIGURE DOCKER ====================
+    - name: Create Docker group
+      group:
+        name: docker
+        state: present
+
+    - name: Add current user to docker group
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+
+    - name: Create Docker daemon config
+      copy:
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+
+    # ==================== START DOCKER ====================
+    - name: Enable Docker service
+      systemd:
+        name: docker
+        enabled: yes
+
+    - name: Start Docker service
+      systemd:
+        name: docker
+        state: started
+
+    - name: Wait for Docker to be ready
+      command: docker info
+      retries: 5
+      delay: 2
+      register: docker_ready
+      until: docker_ready.rc == 0
+      changed_when: false
+
+    # ==================== INSTALL DOCKER COMPOSE STANDALONE ====================
+    - name: Download Docker Compose standalone
+      get_url:
+        url: https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+
+    # ==================== VERIFY INSTALLATION ====================
+    - name: Get Docker version
+      command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Get Docker Compose plugin version
+      command: docker compose version
+      register: compose_plugin_version
+      changed_when: false
+
+    - name: Get Docker Compose standalone version
+      command: docker-compose --version
+      register: compose_standalone_version
+      changed_when: false
+
+    - name: Test Docker with hello-world
+      command: docker run --rm hello-world
+      register: docker_test
+      changed_when: false
+
+    - name: Verify Docker test passed
+      set_fact:
+        docker_works: "{{ 'Hello from Docker' in docker_test.stdout }}"

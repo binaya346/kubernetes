@@ -70,7 +70,6 @@ spec:
             limits:
               memory: "128Mi"
               cpu: "200m"
-          # More lenient probes for Nginx
           livenessProbe:
             httpGet:
               path: /
@@ -91,6 +90,7 @@ spec:
         # Container 2: PHP-FPM
         - name: php-fpm
           image: rijalbinaya2/laravel-app:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 9000
               name: php-fpm
@@ -129,7 +129,6 @@ spec:
             limits:
               memory: "512Mi"
               cpu: "500m"
-          # CRITICAL: Very lenient probes for PHP-FPM
           livenessProbe:
             tcpSocket:
               port: 9000

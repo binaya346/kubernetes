@@ -1,2 +1,0 @@
-- name: Restart Laravel Application Deployment
-  command: kubectl rollout restart deployment/laravel-app -n laravel-app

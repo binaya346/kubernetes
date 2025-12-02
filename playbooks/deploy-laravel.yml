@@ -1,5 +1,5 @@
 ---
-- name: Deploy Laravel Application to Kubernetes with MySQL and Sidecar Pattern
+- name: Deploy Laravel Application to Kubernetes (Multi-Node Setup)
   hosts: master
   become: yes
   vars:
@@ -60,7 +60,7 @@
               storageclass.kubernetes.io/is-default-class: "true"
           provisioner: rancher.io/local-path
           reclaimPolicy: Delete
-          volumeBindingMode: Immediate
+          volumeBindingMode: WaitForFirstConsumer
       when: not sc_exists
       register: sc_manifest_file
 
@@ -76,6 +76,36 @@
       ansible.builtin.command:
         cmd: kubectl get storageclass local-path
       changed_when: false
+
+    # ============================================
+    # Verify Cluster Nodes (Multi-Node Check)
+    # ============================================
+    - name: Get cluster nodes
+      ansible.builtin.command:
+        cmd: kubectl get nodes
+      register: cluster_nodes
+      changed_when: false
+
+    - name: Display cluster topology
+      ansible.builtin.debug:
+        msg: "{{ cluster_nodes.stdout_lines }}"
+
+    - name: Count worker nodes
+      ansible.builtin.shell:
+        cmd: kubectl get nodes --no-headers | grep -v 'control-plane' | wc -l
+      register: worker_count
+      changed_when: false
+
+    - name: Set cluster mode
+      ansible.builtin.set_fact:
+        is_multinode: "{{ worker_count.stdout | int > 0 }}"
+        total_workers: "{{ worker_count.stdout | int }}"
+
+    - name: Display cluster mode
+      ansible.builtin.debug:
+        msg:
+          - "Cluster Mode: {{ 'Multi-Node' if is_multinode else 'Single-Node' }}"
+          - "Worker Nodes: {{ total_workers }}"
 
     # ============================================
     # Copy Manifests to Master Node
@@ -129,19 +159,6 @@
       changed_when: "'created' in configmap_result.stdout or 'configured' in configmap_result.stdout"
 
     # ============================================
-    # CLEANUP BEFORE MYSQL DEPLOY
-    # ============================================
-    - name: Delete stale PVC if exists
-      ansible.builtin.shell:
-        cmd: kubectl delete pvc mysql-pvc -n {{ namespace }} --ignore-not-found=true
-      changed_when: false
-
-    - name: Delete old MySQL pod if exists
-      ansible.builtin.shell:
-        cmd: kubectl delete pod -l app=mysql -n {{ namespace }} --ignore-not-found=true
-      changed_when: false
-
-    # ============================================
     # Step 4: Deploy MySQL
     # ============================================
     - name: Apply MySQL resources (PVC + StatefulSet + Service)
@@ -159,6 +176,17 @@
       until: pvc_status.stdout == "Bound"
       changed_when: false
 
+    - name: Check which node MySQL is scheduled on
+      ansible.builtin.shell:
+        cmd: kubectl get pods -l app=mysql -n {{ namespace }} -o jsonpath='{.items[0].spec.nodeName}'
+      register: mysql_node
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display MySQL node placement
+      ansible.builtin.debug:
+        msg: "MySQL pod scheduled on node: {{ mysql_node.stdout | default('Not yet scheduled') }}"
+
     - name: Wait for MySQL pod to be ready
       ansible.builtin.command:
         cmd: kubectl wait --for=condition=ready pod -l app=mysql -n {{ namespace }} --timeout=180s
@@ -169,11 +197,11 @@
 
     - name: Verify MySQL is running
       ansible.builtin.command:
-        cmd: kubectl get pods -l app=mysql -n {{ namespace }}
+        cmd: kubectl get pods -l app=mysql -n {{ namespace }} -o wide
       register: mysql_pods
       changed_when: false
 
-    - name: Show MySQL pod status
+    - name: Show MySQL pod status with node info
       ansible.builtin.debug:
         msg: "{{ mysql_pods.stdout_lines }}"
 
@@ -194,13 +222,23 @@
       delay: 10
       until: laravel_wait.rc == 0
 
+    - name: Check Laravel pod distribution across nodes
+      ansible.builtin.shell:
+        cmd: kubectl get pods -l app=laravel -n {{ namespace }} -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName --no-headers
+      register: laravel_distribution
+      changed_when: false
+
+    - name: Display Laravel pod distribution
+      ansible.builtin.debug:
+        msg: "{{ laravel_distribution.stdout_lines }}"
+
     - name: Verify Laravel pods are running (2 containers each)
       ansible.builtin.command:
-        cmd: kubectl get pods -l app=laravel -n {{ namespace }}
+        cmd: kubectl get pods -l app=laravel -n {{ namespace }} -o wide
       register: laravel_pods
       changed_when: false
 
-    - name: Show Laravel pod status
+    - name: Show Laravel pod status with node info
       ansible.builtin.debug:
         msg: "{{ laravel_pods.stdout_lines }}"
 
@@ -255,11 +293,11 @@
     # ============================================
     - name: Get all resources in namespace
       ansible.builtin.command:
-        cmd: kubectl get all -n {{ namespace }}
+        cmd: kubectl get all -n {{ namespace }} -o wide
       register: all_resources
       changed_when: false
 
-    - name: Display all resources
+    - name: Display all resources with node info
       ansible.builtin.debug:
         msg: "{{ all_resources.stdout_lines }}"
 
@@ -291,16 +329,16 @@
       register: php_logs
       changed_when: false
       ignore_errors: yes
-
+ 
     - name: Display PHP-FPM logs
       ansible.builtin.debug:
         msg: "{{ php_logs.stdout_lines }}"
       when: php_logs.rc == 0
 
-    - name: Get node IP for external access
+    - name: Get node IPs for external access
       ansible.builtin.shell:
-        cmd: kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'
-      register: node_ip
+        cmd: kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'
+      register: node_ips
       changed_when: false
 
     - name: Display access URL
@@ -309,19 +347,27 @@
           - "=================================="
           - "Laravel Application Deployed!"
           - "=================================="
-          - "Access URL: http://{{ node_ip.stdout }}:30080"
+          - "Cluster Mode: {{ 'Multi-Node (' + total_workers|string + ' workers)' if is_multinode else 'Single-Node' }}"
+          - "Access URLs (any node):"
+          - "{% for ip in node_ips.stdout.split() %}  - http://{{ ip }}:30080{% endfor %}"
           - "Namespace: {{ namespace }}"
           - ""
           - "Resources:"
-          - "  - MySQL: mysql-0 (StatefulSet)"
-          - "  - Laravel: 2 pods with Nginx + PHP-FPM"
+          - "  - MySQL: mysql-0 (StatefulSet) on node {{ mysql_node.stdout | default('N/A') }}"
+          - "  - Laravel: 2+ pods with Nginx + PHP-FPM (distributed across nodes)"
           - "  - Service: laravel-service (NodePort:30080)"
+          - "  - HPA: Min 2, Max 10 replicas"
+          - ""
+          - "Pod Distribution:"
+          - "{{ laravel_distribution.stdout }}"
           - ""
           - "Useful Commands:"
-          - "  kubectl get pods -n {{ namespace }}"
+          - "  kubectl get pods -n {{ namespace }} -o wide"
           - "  kubectl logs -f deployment/laravel -c nginx -n {{ namespace }}"
           - "  kubectl logs -f deployment/laravel -c php-fpm -n {{ namespace }}"
           - "  kubectl exec -it deployment/laravel -c php-fpm -n {{ namespace }} -- bash"
+          - "  kubectl top pods -n {{ namespace }}"
+          - "  kubectl get hpa -n {{ namespace }} --watch"
           - "=================================="
 
     # ============================================
@@ -348,14 +394,27 @@
     - name: Final deployment summary
       ansible.builtin.debug:
         msg:
-          - "Deployment Summary:"
+          - "=================================="
+          - "Deployment Summary"
+          - "=================================="
+          - "Cluster: {{ 'Multi-Node' if is_multinode else 'Single-Node' }}"
+          - "Worker Nodes: {{ total_workers }}"
+          - ""
+          - "Status:"
           - "  ✓ Namespace: {{ namespace }}"
-          - "  ✓ MySQL: {{ 'Running' if mysql_wait.rc == 0 else 'Failed' }}"
+          - "  ✓ MySQL: {{ 'Running on ' + mysql_node.stdout if mysql_wait.rc == 0 else 'Failed' }}"
           - "  ✓ Laravel: {{ 'Running' if laravel_wait.rc == 0 else 'Failed' }}"
           - "  ✓ Service: {{ 'Available' if service_check.rc == 0 else 'Failed' }}"
-          - "  ✓ Storage: local-path (Immediate binding)"
+          - "  ✓ HPA: {{ 'Configured' if hpa_check.rc == 0 else 'Failed' }}"
+          - "  ✓ Storage: local-path (WaitForFirstConsumer)"
+          - ""
+          - "Load Distribution:"
+          - "  - Laravel pods distributed across available nodes"
+          - "  - MySQL pinned to one node (StatefulSet)"
+          - "  - Service accessible from any node IP"
           - ""
           - "Next Steps:"
-          - "  1. Test application: curl http://{{ node_ip.stdout }}:30080"
-          - "  2. Check logs if issues occur"
-          - "  3. Access shell: kubectl exec -it deployment/laravel -c php-fpm -n {{ namespace }} -- bash"
+          - "  1. Test: curl http://{{ node_ips.stdout.split()[0] }}:30080"
+          - "  2. Monitor: kubectl get hpa -n {{ namespace }} --watch"
+          - "  3. Scale test: Generate load to trigger HPA"
+          - "=================================="
